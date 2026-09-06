@@ -1,6 +1,6 @@
 # Course-side exclusions: tests that are environment-sensitive outside the
 # benchmark containers. Format: <branch>/<classname>.<testname>
-#
+
 # All of these assert Linux/glibc-specific behavior that differs on macOS and so
 # fails identically for the gold binary and any correct re-implementation here:
 #
