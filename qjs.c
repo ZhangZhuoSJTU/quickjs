@@ -311,29 +311,42 @@ void help(void)
     exit(1);
 }
 
+typedef struct QJSOptions {
+    char *expression;
+    char *include_list[32];
+    int include_count;
+    int interactive;
+    int dump_memory;
+    int trace_memory;
+    int empty_run;
+    int module;
+    int strict;
+    int load_std;
+    int dump_unhandled_promise_rejection;
+    int strip_flags;
+    size_t memory_limit;
+    size_t stack_size;
+} QJSOptions;
+
+static void qjs_options_init(QJSOptions *options)
+{
+    memset(options, 0, sizeof(*options));
+    options->module = -1;
+    options->dump_unhandled_promise_rejection = 1;
+}
+
 int main(int argc, char **argv)
 {
     JSRuntime *rt;
     JSContext *ctx;
     struct trace_malloc_data trace_data = { NULL };
+    QJSOptions options;
     int optind;
-    char *expr = NULL;
-    int interactive = 0;
-    int dump_memory = 0;
-    int trace_memory = 0;
-    int empty_run = 0;
-    int module = -1;
-    int strict = 0;
-    int load_std = 0;
-    int dump_unhandled_promise_rejection = 1;
-    size_t memory_limit = 0;
-    char *include_list[32];
-    int i, include_count = 0;
-    int strip_flags = 0;
-    size_t stack_size = 0;
+    int i;
 
     /* cannot use getopt because we want to pass the command line to
        the script */
+    qjs_options_init(&options);
     optind = 1;
     while (optind < argc && *argv[optind] == '-') {
         char *arg = argv[optind] + 1;
@@ -359,11 +372,11 @@ int main(int argc, char **argv)
             }
             if (opt == 'e' || !strcmp(longopt, "eval")) {
                 if (*arg) {
-                    expr = arg;
+                    options.expression = arg;
                     break;
                 }
                 if (optind < argc) {
-                    expr = argv[optind++];
+                    options.expression = argv[optind++];
                     break;
                 }
                 fprintf(stderr, "qjs: missing expression for -e\n");
@@ -374,47 +387,47 @@ int main(int argc, char **argv)
                     fprintf(stderr, "expecting filename");
                     exit(1);
                 }
-                if (include_count >= countof(include_list)) {
+                if (options.include_count >= countof(options.include_list)) {
                     fprintf(stderr, "too many included files");
                     exit(1);
                 }
-                include_list[include_count++] = argv[optind++];
+                options.include_list[options.include_count++] = argv[optind++];
                 continue;
             }
             if (opt == 'i' || !strcmp(longopt, "interactive")) {
-                interactive++;
+                options.interactive++;
                 continue;
             }
             if (opt == 'm' || !strcmp(longopt, "module")) {
-                module = 1;
+                options.module = 1;
                 continue;
             }
             if (!strcmp(longopt, "script")) {
-                module = 0;
+                options.module = 0;
                 continue;
             }
             if (!strcmp(longopt, "strict")) {
-                strict = 1;
+                options.strict = 1;
                 continue;
             }
             if (opt == 'd' || !strcmp(longopt, "dump")) {
-                dump_memory++;
+                options.dump_memory++;
                 continue;
             }
             if (opt == 'T' || !strcmp(longopt, "trace")) {
-                trace_memory++;
+                options.trace_memory++;
                 continue;
             }
             if (!strcmp(longopt, "std")) {
-                load_std = 1;
+                options.load_std = 1;
                 continue;
             }
             if (!strcmp(longopt, "no-unhandled-rejection")) {
-                dump_unhandled_promise_rejection = 0;
+                options.dump_unhandled_promise_rejection = 0;
                 continue;
             }
             if (opt == 'q' || !strcmp(longopt, "quit")) {
-                empty_run++;
+                options.empty_run++;
                 continue;
             }
             if (!strcmp(longopt, "memory-limit")) {
@@ -422,7 +435,7 @@ int main(int argc, char **argv)
                     fprintf(stderr, "expecting memory limit");
                     exit(1);
                 }
-                memory_limit = get_suffixed_size(argv[optind++]);
+                options.memory_limit = get_suffixed_size(argv[optind++]);
                 continue;
             }
             if (!strcmp(longopt, "stack-size")) {
@@ -430,15 +443,15 @@ int main(int argc, char **argv)
                     fprintf(stderr, "expecting stack size");
                     exit(1);
                 }
-                stack_size = get_suffixed_size(argv[optind++]);
+                options.stack_size = get_suffixed_size(argv[optind++]);
                 continue;
             }
             if (opt == 's') {
-                strip_flags = JS_STRIP_DEBUG;
+                options.strip_flags = JS_STRIP_DEBUG;
                 continue;
             }
             if (!strcmp(longopt, "strip-source")) {
-                strip_flags = JS_STRIP_SOURCE;
+                options.strip_flags = JS_STRIP_SOURCE;
                 continue;
             }
             if (opt) {
@@ -450,7 +463,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (trace_memory) {
+    if (options.trace_memory) {
         js_trace_malloc_init(&trace_data);
         rt = JS_NewRuntime2(&trace_mf, &trace_data);
     } else {
@@ -460,11 +473,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "qjs: cannot allocate JS runtime\n");
         exit(2);
     }
-    if (memory_limit != 0)
-        JS_SetMemoryLimit(rt, memory_limit);
-    if (stack_size != 0)
-        JS_SetMaxStackSize(rt, stack_size);
-    JS_SetStripInfo(rt, strip_flags);
+    if (options.memory_limit != 0)
+        JS_SetMemoryLimit(rt, options.memory_limit);
+    if (options.stack_size != 0)
+        JS_SetMaxStackSize(rt, options.stack_size);
+    JS_SetStripInfo(rt, options.strip_flags);
     js_std_set_worker_new_context_func(JS_NewCustomContext);
     js_std_init_handlers(rt);
     ctx = JS_NewCustomContext(rt);
@@ -476,16 +489,16 @@ int main(int argc, char **argv)
     /* loader for ES6 modules */
     JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader, js_module_check_attributes, NULL);
 
-    if (dump_unhandled_promise_rejection) {
+    if (options.dump_unhandled_promise_rejection) {
         JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker,
                                           NULL);
     }
 
-    if (!empty_run) {
+    if (!options.empty_run) {
         js_std_add_helpers(ctx, argc - optind, argv + optind);
 
         /* make 'std' and 'os' visible to non module code */
-        if (load_std) {
+        if (options.load_std) {
             const char *str = "import * as std from 'std';\n"
                 "import * as os from 'os';\n"
                 "globalThis.std = std;\n"
@@ -493,40 +506,41 @@ int main(int argc, char **argv)
             eval_buf(ctx, str, strlen(str), "<input>", JS_EVAL_TYPE_MODULE);
         }
 
-        for(i = 0; i < include_count; i++) {
-            if (eval_file(ctx, include_list[i], 0, strict))
+        for (i = 0; i < options.include_count; i++) {
+            if (eval_file(ctx, options.include_list[i], 0, options.strict))
                 goto fail;
         }
 
-        if (expr) {
+        if (options.expression) {
             int eval_flags;
-            if (module > 0) {
+            if (options.module > 0) {
                 eval_flags = JS_EVAL_TYPE_MODULE;
             } else {
                 eval_flags = JS_EVAL_TYPE_GLOBAL;
-                if (strict)
+                if (options.strict)
                     eval_flags |= JS_EVAL_FLAG_STRICT;
             }
-            if (eval_buf(ctx, expr, strlen(expr), "<cmdline>", eval_flags))
+            if (eval_buf(ctx, options.expression, strlen(options.expression),
+                         "<cmdline>", eval_flags))
                 goto fail;
         } else
         if (optind >= argc) {
             /* interactive mode */
-            interactive = 1;
+            options.interactive = 1;
         } else {
             const char *filename;
             filename = argv[optind];
-            if (eval_file(ctx, filename, module, strict))
+            if (eval_file(ctx, filename, options.module, options.strict))
                 goto fail;
         }
-        if (interactive) {
+        if (options.interactive) {
             JS_SetHostPromiseRejectionTracker(rt, NULL, NULL);
             js_std_eval_binary(ctx, qjsc_repl, qjsc_repl_size, 0);
         }
         js_std_loop(ctx);
     }
 
-    if (dump_memory) {
+    if (options.dump_memory) {
         JSMemoryUsage stats;
         JS_ComputeMemoryUsage(rt, &stats);
         JS_DumpMemoryUsage(stdout, &stats, rt);
@@ -535,7 +549,7 @@ int main(int argc, char **argv)
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 
-    if (empty_run && dump_memory) {
+    if (options.empty_run && options.dump_memory) {
         clock_t t[5];
         double best[5];
         int i, j;

@@ -1129,6 +1129,157 @@ static JSValue js_std_printf(JSContext *ctx, JSValueConst this_val,
     return js_printf_internal(ctx, argc, argv, stdout);
 }
 
+typedef void JSConsoleTextRelease(JSContext *ctx, const char *data);
+
+typedef struct JSConsoleText {
+    const char *data;
+    size_t length;
+    JSConsoleTextRelease *release;
+} JSConsoleText;
+
+typedef struct JSConsoleWriter {
+    FILE *stream;
+    const char *separator;
+    size_t separator_length;
+    const char *terminator;
+    size_t terminator_length;
+    int text_flags;
+} JSConsoleWriter;
+
+enum {
+    JS_CONSOLE_TEXT_PRESERVE = 0,
+    JS_CONSOLE_TEXT_CANONICAL = (1 << 0),
+};
+
+static void js_console_release_buffer(JSContext *ctx, const char *data)
+{
+    js_free(ctx, (void *)data);
+}
+
+static void js_console_text_init(JSConsoleText *text, const char *data,
+                                 size_t length)
+{
+    text->data = data;
+    text->length = length;
+    text->release = JS_FreeCString;
+}
+
+static void js_console_text_canonicalize(JSConsoleText *text, int flags)
+{
+    static const uint8_t utf8_signature[] = { 0xef, 0xbb, 0xbf };
+
+    if ((flags & JS_CONSOLE_TEXT_CANONICAL) &&
+        text->length >= sizeof(utf8_signature) &&
+        !memcmp(text->data, utf8_signature, sizeof(utf8_signature))) {
+        text->data += sizeof(utf8_signature);
+        text->length -= sizeof(utf8_signature);
+        text->release = js_console_release_buffer;
+    }
+}
+
+static int js_console_text_from_value(JSContext *ctx, JSConsoleText *text,
+                                      JSValueConst value, int flags)
+{
+    const char *data;
+    size_t length;
+
+    data = JS_ToCStringLen(ctx, &length, value);
+    if (!data)
+        return -1;
+    js_console_text_init(text, data, length);
+    js_console_text_canonicalize(text, flags);
+    return 0;
+}
+
+static void js_console_text_dispose(JSContext *ctx, JSConsoleText *text)
+{
+    JSConsoleTextRelease *release = text->release;
+    const char *data = text->data;
+
+    text->data = NULL;
+    text->length = 0;
+    text->release = NULL;
+    if (release)
+        release(ctx, data);
+}
+
+static void js_console_writer_init(JSConsoleWriter *writer, FILE *stream,
+                                   const char *separator,
+                                   const char *terminator, int text_flags)
+{
+    writer->stream = stream;
+    writer->separator = separator;
+    writer->separator_length = separator ? strlen(separator) : 0;
+    writer->terminator = terminator;
+    writer->terminator_length = terminator ? strlen(terminator) : 0;
+    writer->text_flags = text_flags;
+}
+
+static void js_console_writer_write(JSConsoleWriter *writer,
+                                    const char *data, size_t length)
+{
+    if (length != 0)
+        fwrite(data, 1, length, writer->stream);
+}
+
+static int js_console_writer_write_string(JSContext *ctx,
+                                          JSConsoleWriter *writer,
+                                          JSValueConst value)
+{
+    JSConsoleText text;
+
+    if (js_console_text_from_value(ctx, &text, value, writer->text_flags))
+        return -1;
+    js_console_writer_write(writer, text.data, text.length);
+    js_console_text_dispose(ctx, &text);
+    return 0;
+}
+
+static void js_console_writer_value_write(void *opaque, const char *buf,
+                                          size_t len)
+{
+    JSConsoleWriter *writer = opaque;
+
+    js_console_writer_write(writer, buf, len);
+}
+
+static void js_print_value_write(void *opaque, const char *buf, size_t len)
+{
+    FILE *stream = opaque;
+
+    fwrite(buf, 1, len, stream);
+}
+
+static int js_console_writer_write_value(JSContext *ctx,
+                                         JSConsoleWriter *writer,
+                                         JSValueConst value)
+{
+    if (JS_IsString(value))
+        return js_console_writer_write_string(ctx, writer, value);
+    JS_PrintValue(ctx, js_console_writer_value_write, writer, value, NULL);
+    return 0;
+}
+
+static JSValue js_console_writer_write_args(JSContext *ctx,
+                                            JSConsoleWriter *writer,
+                                            int argc,
+                                            JSValueConst *argv)
+{
+    int i;
+
+    for (i = 0; i < argc; i++) {
+        if (i != 0) {
+            js_console_writer_write(writer, writer->separator,
+                                    writer->separator_length);
+        }
+        if (js_console_writer_write_value(ctx, writer, argv[i]))
+            return JS_EXCEPTION;
+    }
+    js_console_writer_write(writer, writer->terminator,
+                            writer->terminator_length);
+    return JS_UNDEFINED;
+}
+
 static FILE *js_std_file_get(JSContext *ctx, JSValueConst obj)
 {
     JSSTDFile *s = JS_GetOpaque2(ctx, obj, js_std_file_class_id);
@@ -1144,10 +1295,9 @@ static FILE *js_std_file_get(JSContext *ctx, JSValueConst obj)
 static JSValue js_std_file_puts(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int magic)
 {
+    JSConsoleWriter writer;
     FILE *f;
     int i;
-    const char *str;
-    size_t len;
 
     if (magic == 0) {
         f = stdout;
@@ -1157,12 +1307,11 @@ static JSValue js_std_file_puts(JSContext *ctx, JSValueConst this_val,
             return JS_EXCEPTION;
     }
 
-    for(i = 0; i < argc; i++) {
-        str = JS_ToCStringLen(ctx, &len, argv[i]);
-        if (!str)
+    js_console_writer_init(&writer, f, NULL, NULL,
+                           JS_CONSOLE_TEXT_PRESERVE);
+    for (i = 0; i < argc; i++) {
+        if (js_console_writer_write_string(ctx, &writer, argv[i]))
             return JS_EXCEPTION;
-        fwrite(str, 1, len, f);
-        JS_FreeCString(ctx, str);
     }
     return JS_UNDEFINED;
 }
@@ -1193,16 +1342,14 @@ static JSValue js_std_file_printf(JSContext *ctx, JSValueConst this_val,
     return js_printf_internal(ctx, argc, argv, f);
 }
 
-static void js_print_value_write(void *opaque, const char *buf, size_t len)
-{
-    FILE *fo = opaque;
-    fwrite(buf, 1, len, fo);
-}
-
 static JSValue js_std_file_printObject(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv)
 {
-    JS_PrintValue(ctx, js_print_value_write, stdout, argv[0], NULL);
+    JSConsoleWriter writer;
+
+    js_console_writer_init(&writer, stdout, NULL, NULL,
+                           JS_CONSOLE_TEXT_PRESERVE);
+    JS_PrintValue(ctx, js_console_writer_value_write, &writer, argv[0], NULL);
     return JS_UNDEFINED;
 }
 
@@ -4026,27 +4173,11 @@ JSModuleDef *js_init_module_os(JSContext *ctx, const char *module_name)
 static JSValue js_print(JSContext *ctx, JSValueConst this_val,
                         int argc, JSValueConst *argv)
 {
-    int i;
-    JSValueConst v;
-    
-    for(i = 0; i < argc; i++) {
-        if (i != 0)
-            putchar(' ');
-        v = argv[i];
-        if (JS_IsString(v)) {
-            const char *str;
-            size_t len;
-            str = JS_ToCStringLen(ctx, &len, v);
-            if (!str)
-                return JS_EXCEPTION;
-            fwrite(str, 1, len, stdout);
-            JS_FreeCString(ctx, str);
-        } else {
-            JS_PrintValue(ctx, js_print_value_write, stdout, v, NULL);
-        }
-    }
-    putchar('\n');
-    return JS_UNDEFINED;
+    JSConsoleWriter writer;
+
+    js_console_writer_init(&writer, stdout, " ", "\n",
+                           JS_CONSOLE_TEXT_CANONICAL);
+    return js_console_writer_write_args(ctx, &writer, argc, argv);
 }
 
 static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
@@ -4359,4 +4490,3 @@ void js_std_eval_binary_json_module(JSContext *ctx,
         exit(1);
     }
 }
-
